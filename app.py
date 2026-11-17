@@ -15,6 +15,7 @@ API 키: Streamlit Community Cloud > Settings > Secrets 에 OPENAI_API_KEY = "sk
 import os
 import tempfile
 import unicodedata
+import re   # ← 파일 맨 위 import 부분에 추가
 
 import pandas as pd
 import streamlit as st
@@ -38,7 +39,7 @@ except Exception:
     pass  # 로컬 실행 시 환경 변수에 등록된 키 사용
 
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL_WCuvyChN3giYr6Xa2gWMOvRjDUrfb0a"
-DEFAULT_DOC = "AIVLE_School_백서.pdf"
+DEFAULT_DOC = ""
 VIDEO_CSV = "videos.csv"
 CATEGORIES = ["지원 안내", "교육 과정", "후기", "취업", "기타"]
 EMBED_MODEL = "text-embedding-3-small"
@@ -274,3 +275,97 @@ if user_input:
 
     ss.messages.append(("user", user_input, []))
     ss.messages.append(("assistant", answer, video_hits))
+
+
+# ------------------------------------------------------------
+# 1. RAG 파이프라인 (고도화)
+# ------------------------------------------------------------
+NOISE = re.compile(r"^\s*(\**AIVLE School 백서\**|\**KT AIVLE School\**|\d{1,3})\s*$")   # 머리글·바닥글·쪽번호
+HEAD = re.compile(r"^\s*(#{1,6}\s+.*|\**\s*■.*|\**\s*\d{1,2}\)\s.*|\**\s*0\d\s+.*)$")       # ■ 소제목, 1) 제목, 01 장제목
+
+def clean_title(line):
+    return re.sub(r"[#*]", "", line).strip()
+
+def split_by_section(docs, chunk_size=500, chunk_overlap=100):
+    """페이지 문서 → 머리글·바닥글 제거 → 소제목 단위로 묶기 → 청크마다 [소제목] 붙이기"""
+    sections, title, buf = [], "AIVLE School 백서", []
+
+    def flush():
+        text = "\n".join(buf).strip()
+        if re.match(r"^\[\d+\]|목차|C O N T E N T S", title):   # 참고문헌 항목·목차는 검색 대상에서 제외
+            return
+        if text:
+            sections.append(Document(page_content=text, metadata={"section": title}))
+
+    for d in docs:
+        for line in d.page_content.split("\n"):
+            if NOISE.match(line):
+                continue
+            if HEAD.match(line) and len(clean_title(line)) < 60:
+                flush()
+                buf, title = [], clean_title(line)
+            buf.append(line)
+    flush()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=["\n\n", "\n", ".", " ", ""])
+    chunks = splitter.split_documents(sections)
+    for c in chunks:   # 표의 행만 들어 있는 청크도 어떤 주제인지 알 수 있게
+        c.page_content = f"[{c.metadata['section']}]\n{c.page_content}"
+    return chunks
+
+
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+
+def rag_pipeline(filepath, k=6):
+    # PDF 파일 읽기
+    loader = PyMuPDF4LLMLoader(filepath)
+    docs = loader.load()
+
+    # 텍스트 분할 (소제목 단위 + 소제목 붙이기)
+    chunks = split_by_section(docs)
+
+    # Embedding 모델, 벡터 저장소 (백서 전용 컬렉션)
+    embedding = OpenAIEmbeddings(model=EMBED_MODEL)
+    vectorstore = Chroma(collection_name="aivle_docs", embedding_function=embedding)
+    vectorstore.reset_collection()
+    vectorstore.add_documents(chunks)
+
+    # 검색기
+    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+
+    # 질문 → 백서 용어로 바꾼 검색 문장 (쿼리 재작성)
+    llm_rewrite = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    rewrite_prompt = ChatPromptTemplate.from_template(
+        """다음 질문을 'AIVLE School 백서'에서 검색하기 좋은 한 줄 문장으로 바꾸세요.
+- 백서에서 쓰는 말로 바꿉니다. 예) 졸업생→수료생, 어디 취업했나/취업 현황→취업후기·진출 기업·직무·취업 성과,
+  돈·비용→교육비·자기부담금·훈련장려금, 입학시험→역량심사·인적성, 결석→출석·출결 규정
+- 관련 키워드 3~6개를 덧붙이고, 검색 문장 한 줄만 출력하세요.
+질문: {input}""")
+    rewriter = rewrite_prompt | llm_rewrite | StrOutputParser()
+
+    # 답변 LLM, 프롬프트 (미션 4: 역할 지정)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
+    s_msg = """당신은 KT AIVLE School 10기 선배 에이블러이자 학습 도우미 '에이블'입니다.
+에이블스쿨 지원을 고민하는 사람과 교육생이 용기를 내 도전할 수 있도록 친근하고 정확하게 답합니다.
+
+[답변 원칙]
+1. 반드시 아래 [백서] 내용에 근거해 답하세요. 여러 조각에 흩어진 정보는 하나로 모아 정리하세요.
+2. 표에 있는 사례(기업·기수·트랙·직무 등)를 묻는 질문에는 찾은 사례를 빠짐없이 목록으로 보여 주세요.
+3. 백서에 없는 내용은 추측하지 말고 "백서에서 확인되지 않아요. 공식 홈페이지(aivle.kt.co.kr)나 운영 사무국에 확인해 주세요."라고 답하세요.
+4. 답변 끝에 근거가 된 소제목을 '📌 출처: [소제목]' 형식으로 적으세요.
+5. 마지막 줄에는 질문자에게 건네는 짧은 응원 한 마디와, 이어서 물어보면 좋을 질문 1개를 제안하세요.
+
+[백서]
+{context}"""
+    prompt = ChatPromptTemplate.from_messages([("system", s_msg), ("human", "{input}")])
+
+    # RAG 체인: 검색은 재작성한 문장으로, 답변은 원래 질문으로
+    rag_chain = (
+        {"context": rewriter | retriever | format_docs,
+         "input": itemgetter("input")}
+        | prompt | llm | StrOutputParser()
+    )
+    return rag_chain, len(chunks)
