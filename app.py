@@ -2,8 +2,10 @@
 import os
 import re
 import html
+import math
 import uuid
 import tempfile
+import unicodedata
 from operator import itemgetter
 
 import streamlit as st
@@ -13,7 +15,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+import pandas as pd
+import pymupdf
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ─────────────────────────────────────────────
@@ -34,6 +38,9 @@ DEFAULT_PDF = "AIVLE School 백서.pdf"
 MODEL = "gpt-4o-mini"
 LOGO_URL = "https://raw.githubusercontent.com/Jangrae/img/master/aivle.png"
 HISTORY_TURNS = 6                   # 대화 맥락으로 넘길 최근 메시지 수
+PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL_WCuvyChN3giYr6Xa2gWMOvRjDUrfb0a"
+VIDEO_CSV = "videos.csv"            # title, url, category, keywords, description
+VIDEO_CATEGORIES = ["지원 안내", "교육 과정", "후기", "취업", "기타"]
 
 # ─────────────────────────────────────────────
 # 1. 시스템 메시지 (역할 지정)
@@ -49,6 +56,9 @@ KT 에이블스쿨을 먼저 경험한 든든한 선배이자 학습 멘토로�
    - 모집 일정·자격·혜택처럼 기수마다 바뀌는 정보는 "몇 기 기준"인지 함께 밝히고, 최종 확인은 공식 홈페이지(aivle.kt.co.kr)에서 하도록 한 줄 안내합니다.
    - 선배 사례(전공, 기수, 성과)가 문서에 있으면 1~2개를 구체적으로 들어 설득력을 높입니다.
    - 문서 안의 [1], [12] 같은 출처 번호 표기는 답변에 옮기지 않습니다.
+   - 문서에서 '[표]'로 시작하는 줄은 표의 한 행입니다. 표를 묻는 질문에는 행을 빠짐없이 마크다운 표로 다시 정리합니다.
+   - 특정 선배·교육생 사례를 물으면 그 사례의 배경 → '이렇게 공부했다/준비했다' → '나의 실천 방법(교훈)' 순서로 정리합니다.
+   - 공부법·학습 전략을 물으면 방법의 근거(실험·원리)와 에이블스쿨에서 바로 쓰는 방법을 함께 알려 줍니다.
 
 2. 답변 구조 (마크다운):
    - 첫 줄: 질문에 대한 **핵심 답변 한 문장**을 굵게 씁니다.
@@ -84,6 +94,7 @@ FOLLOWUP_PROMPT = """다음은 에이블스쿨 학습 도우미와 사용자의 
 
 # ─────────────────────────────────────────────
 # 2. RAG 파이프라인
+#    (고도화) 표 인식 로더 + 소제목 경로 청크 + 질문 키워드 보강 + 소제목 직접 찾기 + 소제목 전체 근거
 # ─────────────────────────────────────────────
 def clean_text(text):
     """PDF 변환 과정에서 섞인 마크다운·HTML·출처 번호·URL 제거"""
@@ -129,6 +140,209 @@ def get_embedding():
     return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
+def find_file(target, folder="."):
+    """띄어쓰기·밑줄·대소문자·한글 자모 분리(NFD)와 상관없이 파일 찾기"""
+    norm = lambda x: re.sub(r"[\s_]", "", unicodedata.normalize("NFC", x)).lower()
+    for f in os.listdir(folder):
+        if norm(f) == norm(target):
+            return os.path.join(folder, f)
+    return None
+
+
+# (1) PDF 읽기: 본문과 표를 따로 읽고, 표는 행마다 '열 이름: 값'으로 바꾸기
+def _cell(c):
+    return re.sub(r"\s+", " ", (c or "")).strip()
+
+
+def table_to_lines(tab, prev_header=None):
+    rows = [[_cell(c) for c in r if _cell(c)] for r in tab.extract()]   # 병합 셀로 생긴 빈 칸 제거
+    rows = [r for r in rows if r]
+    out, header, last = [], None, None
+    # 페이지를 넘어 이어진 표(머리행 없음)는 앞 표의 머리행을 이어 씀
+    if rows and prev_header and tab.bbox[1] < 120 and len(rows[0]) == len(prev_header) and rows[0] != prev_header:
+        header = prev_header
+    for r in rows:
+        if header is None:
+            if len(r) >= 2:
+                header = r                          # 2칸 이상인 첫 행 = 머리행
+            else:
+                out.append(r[0])                    # 머리행 앞의 제목·인용 문장
+            continue
+        if len(r) == 1 and last is not None:        # 다음 줄로 넘어간 셀 → 앞 행에 이어 붙이기
+            out[last] += " " + r[0]
+            continue
+        if len(r) == len(header):
+            out.append("[표] " + " / ".join(f"{h}: {v}" for h, v in zip(header, r)))
+        else:
+            out.append("[표] " + " / ".join(r))
+        last = len(out) - 1
+    if header is not None and last is None:         # 머리행만 있는 1행짜리 표(숫자 카드 등)
+        out.append(" / ".join(header))
+    return out, header
+
+
+def load_pdf_with_tables(path, top=50, bottom=50):
+    """표지·목차·참고문헌은 빼고, 본문과 표를 읽는 순서대로 합쳐 페이지별 Document로"""
+    pdf = pymupdf.open(path)
+    texts = [p.get_text() for p in pdf]
+    start = next((i for i, t in enumerate(texts) if "Before You Read" in t or "About KT AIVLE School" in t), 0)
+    end = next((i for i, t in enumerate(texts) if "R E F E R E N C E S" in t), len(texts))
+    docs, prev_header = [], None
+    for pno in range(start, end):
+        page = pdf[pno]
+        H = page.rect.height
+        tabs = page.find_tables().tables
+        boxes = [pymupdf.Rect(t.bbox) for t in tabs]
+        items = []
+        for t in tabs:
+            lines, prev_header = table_to_lines(t, prev_header)
+            if lines:
+                items.append((t.bbox[1], "\n".join(lines)))
+        for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
+            if y1 < top or y0 > H - bottom:                            # 머리글·바닥글
+                continue
+            if any(pymupdf.Rect(x0, y0, x1, y1).intersects(b) for b in boxes):
+                continue                                                 # 표 안의 글자는 위에서 처리
+            t = re.sub(r"[^\S\n]+", " ", text).strip()                       # 탭·특수 공백 정리
+            if t:
+                items.append((y0, t))
+        items.sort(key=lambda x: x[0])
+        text = "\n".join(t for _, t in items)
+        text = re.sub(r"(\d) (기|주|편|일|회|건|개월|차|명|시간)", r"\1\2", text)   # PDF의 '10 기' → '10기'
+        docs.append(Document(page_content=text, metadata={"page": pno}))
+    return docs
+
+
+# (2) 장(01) › 절(1)) › 소제목(■) 경로를 붙여 청크 만들기
+H1 = re.compile(r"^\s*0\d\s+\S.*$|^\s*(들어가며|—\s*맺음말|—\s*부록|부록)\b.*$")      # 01 에이블스쿨 소개
+H2 = re.compile(r"^\s*\d{1,2}\)\s+\S.*$|^\s*(지원·합격 단계의 선배 이야기|선배 후기에서 발견한|"
+                r"최근 선배 후기에서 뽑은|에이블러가 후배에게 전하는|알아둘 변화).*$")     # 5) 매일 기록한 선배
+H3 = re.compile(r"^\s*■\s*\S.*$")                                                          # ■ 이렇게 공부했다
+
+
+def split_by_section(docs, chunk_size=500, chunk_overlap=100):
+    sections = []
+    h1 = h2 = h3 = ""
+    buf, page = [], 0
+
+    def path():
+        return " › ".join(x for x in (h1, h2, h3) if x)
+
+    def flush():
+        text = "\n".join(buf).strip()
+        if text:
+            sections.append(Document(page_content=text,
+                                     metadata={"section": path() or "AIVLE School 백서",
+                                               "parent": " › ".join(x for x in (h1, h2) if x),
+                                               "page": page}))
+
+    for d in docs:
+        for line in d.page_content.split("\n"):
+            s = line.strip()
+            if len(s) < 60 and (H1.match(s) or H2.match(s) or H3.match(s)):
+                flush()
+                buf, page = [], d.metadata["page"]
+                if H1.match(s):
+                    h1, h2, h3 = s, "", ""
+                elif H2.match(s):
+                    h2, h3 = s, ""
+                else:
+                    h3 = s
+            elif not buf:
+                page = d.metadata["page"]
+            buf.append(line)
+    flush()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=["\n\n", "\n", ".", " ", ""])
+    chunks = splitter.split_documents(sections)
+    for c in chunks:   # 표의 행만 있는 청크도 어떤 주제인지 알 수 있게 경로를 붙임
+        c.page_content = f"[{c.metadata['section']}]\n{c.page_content}"
+    return chunks, sections
+
+
+# (3) 질문 키워드 보강: 질문에 쓰는 말 → 백서 소제목에 쓰인 말
+QUERY_HINTS = [
+    (r"졸업생|선배들", "수료생 선배 후기"),
+    (r"공부법|학습법|공부 방법|공부를 어떻게|암기|기억|까먹|잊", "인출 연습 간격 반복 학습법 복습"),
+    (r"복습", "인출 연습 간격 반복 복습 간격 경험칙"),
+    (r"TIL|til|기록|일지|블로그|회고", "TIL 기록 학습법 매일 기록한 선배 95편 학습 일지"),
+    (r"AICE|에이스|자격증", "AICE Associate 합격"),
+    (r"합격|붙|자소서|자기소개서|지원서|서류", "합격 후기 자기소개서 인재상 준비법"),
+    (r"인적성|역량검사|역량심사|도형|시험", "인적성 준비 도형 시험 환경 합격"),
+    (r"10기|처음|초반|첫 ?(달|주)|두 ?달|8주|입교하면|주차", "10기 DX 트랙 교육생의 첫 8주"),
+    (r"교육후기|후기|경험|성장|스터디|공모전|수상|비전공|전공", "공식 교육후기 10건 교육생 경험과 성장 전공 여부 프로젝트 스터디 도전 활동"),
+    (r"전략|원칙|시기별|단계별|점검|체크", "시기별 전략 학습·프로젝트의 다섯 가지 원칙 단원 마무리 셀프 점검"),
+    (r"어렵|힘들|따라가|못 ?따라", "학습 난이도와 경험 해석 3주차의 벽 공통점"),
+]
+
+
+def expand_query(q):
+    extra = [hint for pat, hint in QUERY_HINTS if re.search(pat, q)]
+    return q + (" " + " ".join(extra) if extra else "")
+
+
+def _tokens(s):
+    s = re.sub(r"(\d)\s+(기|주|편|일|회|건|개월|차)", r"\1\2", s)     # '10 기' → '10기'
+    return [w for w in re.findall(r"[가-힣A-Za-z0-9]+", s) if len(w) >= 2]
+
+
+class SectionIndex:
+    """소제목 전체 내용 보관 + 질문과 소제목 이름을 직접 비교해 해당 절 찾기"""
+
+    def __init__(self, sections):
+        self.text, self.parent_text = {}, {}
+        for s in sections:
+            self.text.setdefault(s.metadata["section"], []).append(s.page_content)
+            self.parent_text.setdefault(s.metadata["parent"], []).append(s.page_content)
+        self.text = {k: "\n".join(v) for k, v in self.text.items()}
+        self.parent_text = {k: "\n".join(v) for k, v in self.parent_text.items()}
+        self.first = {}
+        for s in sections:
+            self.first.setdefault(s.metadata["section"], s)
+        titles = list(self.text)
+        df = {}
+        for t in titles:
+            for w in set(_tokens(t)):
+                df[w] = df.get(w, 0) + 1
+        self.idf = {w: math.log(1 + len(titles) / n) for w, n in df.items()}
+
+    def route(self, query, top=2):
+        q = set(_tokens(query))
+        scored = []
+        for title in self.text:
+            tt = set(_tokens(title.split(" › ", 1)[-1]))        # 장 이름은 빼고 절·소제목으로 비교
+            hit = [w for w in tt if any(w in x or x in w for x in q if len(x) >= 2)]
+            score = sum(self.idf.get(w, 0) for w in hit)
+            if score > 0:
+                scored.append((score, title))
+        scored.sort(reverse=True)
+        best = scored[0][0] if scored else 0
+        out, parents = [], set()
+        for s, t in scored:                       # 같은 절(1))에서는 하나만 → 서로 다른 절을 고르게
+            p = self.first[t].metadata["parent"]
+            if s < max(2.0, best * 0.6) or p in parents:
+                continue
+            parents.add(p)
+            out.append(self.first[t])
+            if len(out) == top:
+                break
+        return out
+
+    def expand(self, docs, limit=3500):
+        """검색된 조각 → 그 절(1)) 전체가 짧으면 절 전체, 길면 소제목(■) 전체"""
+        seen, out = set(), []
+        for d in docs:
+            parent, sec = d.metadata.get("parent", ""), d.metadata.get("section", "")
+            ptxt = self.parent_text.get(parent, "")
+            key, body = (parent, ptxt) if parent and len(ptxt) <= limit else (sec, self.text.get(sec, d.page_content))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"[{key}]\n{body[:limit]}")
+        return "\n\n".join(clean_text(x) for x in out)
+
+
 CONDENSE_PROMPT = """이전 대화를 참고해, 마지막 질문을 앞의 맥락 없이도 이해되는 하나의 검색용 질문으로 바꿔 주세요.
 질문만 한 줄로 출력합니다.
 
@@ -139,7 +353,7 @@ CONDENSE_PROMPT = """이전 대화를 참고해, 마지막 질문을 앞의 맥�
 {input}"""
 
 
-def build_chain(retriever):
+def build_chain(retriever, index=None):
     """검색 결과(docs)와 답변(answer)을 함께 돌려주는 RAG 체인"""
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -149,39 +363,45 @@ def build_chain(retriever):
     llm = ChatOpenAI(model=MODEL, temperature=0.3, streaming=True)
     condense_llm = ChatOpenAI(model=MODEL, temperature=0)
 
-    # "그럼 DX 트랙은요?" 같은 이어지는 질문도 백서에서 잘 찾도록 검색어 재작성
+    # "그럼 DX 트랙은요?" 같은 이어지는 질문도 백서에서 잘 찾도록 검색어 재작성 + 키워드 보강
     def search_query(x):
-        if not x.get("history"):
-            return x["input"]
-        hist = "\n".join(
-            f"{'사용자' if isinstance(m, HumanMessage) else '도우미'}: {m.content[:300]}"
-            for m in x["history"][-4:])
-        try:
-            return condense_llm.invoke(CONDENSE_PROMPT.format(history=hist, input=x["input"])).content.strip()
-        except Exception:
-            return x["input"]
+        q = x["input"]
+        if x.get("history"):
+            hist = "\n".join(
+                f"{'사용자' if isinstance(m, HumanMessage) else '도우미'}: {m.content[:300]}"
+                for m in x["history"][-4:])
+            try:
+                q = condense_llm.invoke(CONDENSE_PROMPT.format(history=hist, input=x["input"])).content.strip()
+            except Exception:
+                pass
+        return expand_query(q)
+
+    # 벡터 검색 결과 앞에, 질문과 이름이 맞는 소제목을 먼저 넣기
+    def retrieve(q):
+        found = retriever.invoke(q)
+        routed = index.route(q) if index else []
+        return filter_docs(routed + found)
+
+    def make_context(x):
+        return index.expand(x["docs"]) if index else format_docs(x["docs"])
 
     answer_chain = (
-        RunnablePassthrough.assign(context=lambda x: format_docs(x["docs"]))
+        RunnablePassthrough.assign(context=make_context)
         | prompt
         | llm
         | StrOutputParser()
     )
     return (
-        RunnablePassthrough.assign(docs=RunnableLambda(search_query) | retriever | RunnableLambda(filter_docs))
+        RunnablePassthrough.assign(docs=RunnableLambda(search_query) | RunnableLambda(retrieve))
         .assign(answer=answer_chain)
     )
 
 
 def rag_pipeline(path):
-    """01번 노트북의 rag_pipeline(): PDF 경로 → 로드 → 분할 → 임베딩 → 벡터 저장소 → RAG 체인"""
-    docs = PyMuPDF4LLMLoader(path).load()
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100,
-        separators=["\n\n", "\n", ".", " ", ""])
-    chunks = [c for c in splitter.split_documents(docs) if not is_reference_chunk(c.page_content)]
+    """01번 노트북의 rag_pipeline(): PDF 경로 → 로드(표 인식) → 소제목 분할 → 임베딩 → 벡터 저장소 → RAG 체인"""
+    docs = load_pdf_with_tables(path)
+    chunks, sections = split_by_section(docs)
+    chunks = [c for c in chunks if not is_reference_chunk(c.page_content)]
 
     # 업로드 문서는 메모리 저장소에 (이름 충돌 방지용 고유 컬렉션)
     vectorstore = Chroma.from_documents(
@@ -191,12 +411,17 @@ def rag_pipeline(path):
 
     retriever = vectorstore.as_retriever(
         search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
-    return build_chain(retriever)
+    return build_chain(retriever, SectionIndex(sections))
 
 
 @st.cache_resource(show_spinner="백서를 불러오는 중입니다...")
 def get_default_chain():
-    """앱 시작 시 기본 백서 체인 (한 번만 생성되어 모든 세션이 공유)"""
+    """앱 시작 시 기본 백서 체인 (한 번만 생성되어 모든 세션이 공유)
+    - 저장소에 백서 PDF가 있으면 고도화 파이프라인으로 생성
+    - PDF가 없으면 Colab에서 만든 chroma_db 사용(기본 검색)"""
+    pdf = find_file(DEFAULT_PDF)
+    if pdf:
+        return rag_pipeline(pdf)
     if os.path.isdir(CHROMA_DIR):
         vectorstore = Chroma(
             collection_name=COLLECTION,
@@ -206,8 +431,6 @@ def get_default_chain():
             retriever = vectorstore.as_retriever(
                 search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
             return build_chain(retriever)
-    if os.path.exists(DEFAULT_PDF):
-        return rag_pipeline(DEFAULT_PDF)
     return None
 
 
@@ -362,6 +585,29 @@ SIDEBAR_QUESTIONS = [
     "💼 수료 후에는 어떤 취업 지원을 받을 수 있나요?",
 ]
 
+# 02 선배 후기(매일 기록·합격 후기·10기 첫 8주·공식 교육후기) + 03 학습 전략 질문
+STORY_QUESTIONS = [
+    "✍️ 95편을 매일 기록한 선배는 어떻게 공부했나요?",
+    "📝 합격한 선배들은 자기소개서와 인적성을 어떻게 준비했나요?",
+    "🗓️ 10기 교육생의 첫 8주는 어땠나요?",
+    "🌱 공식 교육후기로 본 교육생들의 성장 사례를 알려 주세요",
+    "🧠 인출 연습과 간격 반복 학습법은 어떻게 하나요?",
+    "📒 TIL은 어떻게 쓰면 되나요? 템플릿도 보여 주세요",
+    "🧭 시기별 학습 전략과 다섯 가지 원칙을 알려 주세요",
+]
+
+
+@st.cache_data
+def load_videos():
+    """videos.csv(title, url, category, keywords, description) 읽기. 없으면 빈 표"""
+    path = find_file(VIDEO_CSV)
+    if path is None:
+        return pd.DataFrame(columns=["title", "url", "category", "keywords", "description"])
+    df = pd.read_csv(path, encoding="utf-8-sig").fillna("")
+    df = df[df["url"].astype(str).str.startswith("http")]
+    df.loc[~df["category"].isin(VIDEO_CATEGORIES), "category"] = "기타"
+    return df.reset_index(drop=True)
+
 with st.sidebar:
     st.markdown(f'<div class="logo-card"><img src="{LOGO_URL}" alt="AIVLE"></div>', unsafe_allow_html=True)
     st.caption("에이블스쿨은 AI/DX 인재를 양성하는 KT의 교육 프로그램입니다.")
@@ -394,6 +640,26 @@ with st.sidebar:
     st.markdown("#### 💡 추천 질문")
     for i, q in enumerate(SIDEBAR_QUESTIONS):
         st.button(q, key=f"side_q_{i}", on_click=ask, args=(q.split(" ", 1)[1],))
+
+    with st.expander("📖 선배 후기 · 학습 전략 더 물어보기"):
+        for i, q in enumerate(STORY_QUESTIONS):
+            st.button(q, key=f"story_q_{i}", on_click=ask, args=(q.split(" ", 1)[1],))
+
+    # 유튜브 재생목록으로 이동 + 카테고리별 영상 둘러보기
+    st.divider()
+    st.markdown("#### 🎬 에이블스쿨 영상")
+    st.link_button("▶ 유튜브 재생목록 전체 보기", PLAYLIST_URL, use_container_width=True)
+    videos = load_videos()
+    if not videos.empty:
+        counts = videos["category"].value_counts()
+        options = [c for c in VIDEO_CATEGORIES if c in counts.index]
+        category = st.selectbox("카테고리", options, format_func=lambda c: f"{c} ({counts[c]}편)")
+        for r in videos[videos["category"] == category].itertuples():
+            with st.expander(r.title):
+                st.video(r.url)
+                if r.description:
+                    st.caption(r.description)
+                st.link_button("유튜브에서 보기", r.url, use_container_width=True)
 
     st.divider()
     n_q = sum(1 for m in st.session_state.messages if m["role"] == "user")
@@ -491,9 +757,14 @@ def to_sources(docs):
         if isinstance(page, int):
             page += 1
         raw = d.page_content
-        # 청크 안의 첫 번째 제목을 소제목으로 사용
-        m = re.search(r"^\s*#{1,6}\s*(.+)$", raw, flags=re.M)
-        title = clean_text(m.group(1))[:60] if m else ""
+        if d.metadata.get("section"):
+            # 고도화 청크: 맨 앞 [장 › 절 › 소제목] 경로를 소제목으로 사용
+            title = clean_text(d.metadata["section"].split(" › ", 1)[-1])[:60]
+            raw = re.sub(r"^\[[^\]]*\]\n", "", raw)
+        else:
+            # 청크 안의 첫 번째 제목을 소제목으로 사용
+            m = re.search(r"^\s*#{1,6}\s*(.+)$", raw, flags=re.M)
+            title = clean_text(m.group(1))[:60] if m else ""
         text = clean_text(raw).replace("\n", " ")
         if title and text.startswith(title):
             text = text[len(title):].strip()
