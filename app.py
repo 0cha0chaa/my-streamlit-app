@@ -38,7 +38,7 @@ except Exception:
     pass  # 로컬 실행 시 환경 변수에 등록된 키 사용
 
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL_WCuvyChN3giYr6Xa2gWMOvRjDUrfb0a"
-DEFAULT_DOC = "AIVLE School 백서.pdf"
+DEFAULT_DOC = "AIVLE_School_백서.pdf"
 VIDEO_CSV = "videos.csv"
 CATEGORIES = ["지원 안내", "교육 과정", "후기", "취업", "기타"]
 EMBED_MODEL = "text-embedding-3-small"
