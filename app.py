@@ -297,9 +297,11 @@ class SectionIndex:
             self.parent_text.setdefault(s.metadata["parent"], []).append(s.page_content)
         self.text = {k: "\n".join(v) for k, v in self.text.items()}
         self.parent_text = {k: "\n".join(v) for k, v in self.parent_text.items()}
-        self.first = {}
+        self.first, self.sec_docs, self.parent_docs = {}, {}, {}
         for s in sections:
             self.first.setdefault(s.metadata["section"], s)
+            self.sec_docs.setdefault(s.metadata["section"], []).append(s)
+            self.parent_docs.setdefault(s.metadata["parent"], []).append(s)
         titles = list(self.text)
         df = {}
         for t in titles:
@@ -341,6 +343,22 @@ class SectionIndex:
             seen.add(key)
             out.append(f"[{key}]\n{body[:limit]}")
         return "\n\n".join(clean_text(x) for x in out)
+
+    def evidence(self, docs, limit=3500):
+        """답변 근거 후보: expand()와 같은 단위로, 줄마다 (내용, 소제목, 쪽) 보관"""
+        seen, out = set(), []
+        for d in docs:
+            parent, sec = d.metadata.get("parent", ""), d.metadata.get("section", "")
+            ptxt = self.parent_text.get(parent, "")
+            key, parts = (parent, self.parent_docs.get(parent, [])) if parent and len(ptxt) <= limit \
+                else (sec, self.sec_docs.get(sec, [d]))
+            if key in seen:
+                continue
+            seen.add(key)
+            lines = [(line, p.metadata.get("section", ""), p.metadata.get("page"))
+                     for p in parts for line in p.page_content.split("\n") if line.strip()]
+            out.append({"key": key, "lines": lines})
+        return out
 
 
 CONDENSE_PROMPT = """이전 대화를 참고해, 마지막 질문을 앞의 맥락 없이도 이해되는 하나의 검색용 질문으로 바꿔 주세요.
@@ -393,6 +411,7 @@ def build_chain(retriever, index=None):
     )
     return (
         RunnablePassthrough.assign(docs=RunnableLambda(search_query) | RunnableLambda(retrieve))
+        .assign(evidence=lambda x: index.evidence(x["docs"]) if index else None)
         .assign(answer=answer_chain)
     )
 
@@ -750,21 +769,73 @@ def render_sources(sources):
         st.markdown("".join(cards), unsafe_allow_html=True)
 
 
-def to_sources(docs):
+def _bigrams(text):
+    t = re.sub(r"[^가-힣A-Za-z0-9]", "", text.lower())
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def to_sources(docs, evidence=None, question="", answer="", top=3):
+    """답변 근거 카드: 실제 답변과 가장 많이 겹치는 백서 문장을 골라 보여 주기"""
+    if not evidence:
+        return _to_sources_simple(docs)
+
+    ans, qb = _bigrams(clean_text(answer)), _bigrams(question)
+    rows = []                                   # (전체 순번, 근거 묶음 번호, 문장, 소제목, 쪽, bigram)
+    for gi, ev in enumerate(evidence):
+        for li, (line, sec, page) in enumerate(ev["lines"]):
+            t = re.sub(r"^[●•▸\-]\s*", "", clean_text(line).replace("[표] ", ""))
+            if len(t) < 10 or re.match(r"^(■|\d{1,2}\)|0\d\s)", t):   # 제목 줄은 발췌에서 제외
+                continue
+            rows.append((li, gi, t, sec, page, _bigrams(t)))
+    if not rows:
+        return _to_sources_simple(docs)
+
+    # 흔한 말(합니다, 있습니다 등)은 낮게, 드문 말은 높게
+    df = {}
+    for r in rows:
+        for g in r[5]:
+            df[g] = df.get(g, 0) + 1
+    idf = {g: math.log(1 + len(rows) / n) for g, n in df.items()}
+
+    def score(b):
+        hit = sum(idf[g] for g in b & ans) + 0.3 * sum(idf[g] for g in b & qb)
+        return hit / (sum(idf[g] for g in b) ** 0.5 + 1e-9)
+
+    groups = {}
+    for li, gi, t, sec, page, b in rows:
+        groups.setdefault(gi, []).append((score(b), li, t, sec, page))
+    ranked = []
+    for gi, items in groups.items():
+        best = sorted(items, reverse=True)[:3]
+        ranked.append((sum(x[0] for x in best[:2]), best))
+    ranked.sort(key=lambda x: -x[0])
+    if not ranked or ranked[0][0] <= 0:
+        return []
+
+    out = []
+    for total, best in ranked:
+        if total < ranked[0][0] * 0.45 or len(out) == top:
+            break
+        lead = best[0]
+        picked = sorted([x for x in best if x[0] >= lead[0] * 0.5], key=lambda x: x[1])   # 원래 순서대로
+        text = " … ".join(x[2] for x in picked)
+        page = lead[4] + 1 if isinstance(lead[4], int) else None
+        title = clean_text(lead[3].split(" › ", 1)[-1])[:70]
+        out.append({"page": page, "title": title,
+                    "text": text[:320] + ("…" if len(text) > 320 else "")})
+    return out
+
+
+def _to_sources_simple(docs):
+    """(기본 chroma_db 사용 시) 검색된 조각 앞부분을 그대로 보여 주기"""
     out = []
     for d in docs or []:
         page = d.metadata.get("page")
         if isinstance(page, int):
             page += 1
         raw = d.page_content
-        if d.metadata.get("section"):
-            # 고도화 청크: 맨 앞 [장 › 절 › 소제목] 경로를 소제목으로 사용
-            title = clean_text(d.metadata["section"].split(" › ", 1)[-1])[:60]
-            raw = re.sub(r"^\[[^\]]*\]\n", "", raw)
-        else:
-            # 청크 안의 첫 번째 제목을 소제목으로 사용
-            m = re.search(r"^\s*#{1,6}\s*(.+)$", raw, flags=re.M)
-            title = clean_text(m.group(1))[:60] if m else ""
+        m = re.search(r"^\s*#{1,6}\s*(.+)$", raw, flags=re.M)
+        title = clean_text(m.group(1))[:60] if m else ""
         text = clean_text(raw).replace("\n", " ")
         if title and text.startswith(title):
             text = text[len(title):].strip()
@@ -811,6 +882,8 @@ if user_input:
         for chunk in st.session_state.chain.stream({"input": user_input, "history": history}):
             if "docs" in chunk:
                 holder["docs"] = chunk["docs"]
+            if "evidence" in chunk:
+                holder["evidence"] = chunk["evidence"]
             if "answer" in chunk:
                 yield chunk["answer"]
 
@@ -821,7 +894,8 @@ if user_input:
         except Exception as e:
             answer = f"⚠️ 답변 생성 중 문제가 발생했어요: {e}"
             st.error(answer)
-        sources = to_sources(holder.get("docs"))
+        sources = to_sources(holder.get("docs"), holder.get("evidence"),
+                             user_input, answer if isinstance(answer, str) else "")
         render_sources(sources)
 
     with st.spinner("이어서 물어볼 질문을 고르는 중..."):
